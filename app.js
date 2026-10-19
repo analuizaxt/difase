@@ -1,0 +1,392 @@
+/* DIFASE v0.9 — Static scientific research showcase; no trained-model inference. */
+(() => {
+  'use strict';
+  const $ = id => document.getElementById(id);
+  const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+  const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const durationString = t => {const s=Math.max(0,Math.floor(t)); const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60;return h?`${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`:`${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`;};
+  const eeg = {mode:'awaiting',channels:[],active:new Set(),start:0,span:30,duration:600,gain:1,file:null,cursor:null,playing:false,playTimer:null};
+  let currentView=null, pageTimer=null;
+
+  function fitCanvas(el){if(!el)return null;const box=el.getBoundingClientRect();if(box.width<2||box.height<2)return null;const ratio=Math.min(devicePixelRatio||1,2),iw=Math.round(box.width*ratio),ih=Math.round(box.height*ratio);if(el.width!==iw||el.height!==ih){el.width=iw;el.height=ih;}const ctx=el.getContext('2d');ctx.setTransform(ratio,0,0,ratio,0,0);return{ctx,w:box.width,h:box.height};}
+  function routeInfo(){let p=decodeURI(location.hash||'#/');if(!p.startsWith('#/'))return{page:'homeView',segment:null};p=p.slice(2).replace(/\/$/,'');if(p==='about')return{page:'homeView',segment:'aboutSection'};if(p==='modules')return{page:'homeView',segment:'moduleSection'};if(p==='eeg')return{page:'eegView'};if(p==='diffusion')return{page:'diffusionView'};if(p==='architecture')return{page:'architectureView'};return{page:'homeView'};}
+  function showRoute(initial=false){const info=routeInfo();const sameView=currentView===info.page;
+    function activate(){for(const id of ['homeView','eegView','diffusionView','architectureView'])$(id).hidden=(id!==info.page);currentView=info.page;
+      document.title=({'homeView':'Signal dynamics, explored','eegView':'EEG Data Explorer','diffusionView':'Diffusion Playground','architectureView':'Architecture Explorer'}[info.page])+' — DIFASE';
+      if(info.segment){requestAnimationFrame(()=>$(info.segment).scrollIntoView({behavior:initial||reduceMotion?'instant':'smooth',block:'start'}));}else window.scrollTo({top:0,behavior:'instant'});
+      if(info.page==='eegView'){updateSourceUI();}if(info.page==='diffusionView'){updateDiffusion();}
+      document.body.dataset.route=info.page;
+      revealOnView();if(eeg.playing&&info.page!=='eegView')stopPlayback();if(diffPlaying&&info.page!=='diffusionView')stopDiffusionPlayback();
+      updateHeader();
+    }
+    if(initial){activate();return;}
+    clearTimeout(pageTimer);
+    if(sameView){activate();return;}
+    const veil=$('transitionVeil');veil.classList.remove('switching');void veil.offsetHeight;veil.classList.add('switching');pageTimer=setTimeout(activate,reduceMotion?0:215);setTimeout(()=>veil.classList.remove('switching'),650);
+  }
+  function bindNavigation(){window.addEventListener('hashchange',()=>showRoute());const menu=$('menuButton');menu.addEventListener('click',()=>{const open=$('mobileMenu').classList.toggle('open');menu.classList.toggle('open',open);menu.setAttribute('aria-expanded',String(open));});for(const a of document.querySelectorAll('.mobile-menu a'))a.addEventListener('click',()=>{menu.classList.remove('open');$('mobileMenu').classList.remove('open');menu.setAttribute('aria-expanded','false');});window.addEventListener('scroll',()=>{updateHeader();updateArtParallax();},{passive:true});}
+  function bindCredits(){const toggle=$('creditsToggle'),panel=$('creditsPanel');if(!toggle||!panel)return;toggle.addEventListener('click',()=>{const open=toggle.getAttribute('aria-expanded')==='true';toggle.setAttribute('aria-expanded',String(!open));panel.hidden=open;if(!open){requestAnimationFrame(()=>panel.scrollIntoView({block:'nearest',behavior:reduceMotion?'instant':'smooth'}));}});document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!panel.hidden){toggle.click();toggle.focus();}});}
+  function updateHeader(){const header=$('siteHeader');const awayFromHero=currentView!=='homeView'||window.scrollY>60;header.classList.toggle('scrolled',window.scrollY>60);header.classList.toggle('hero-top',!awayFromHero);}
+  let observer;
+  function revealOnView(){if(!observer){observer=new IntersectionObserver(entries=>{entries.forEach(e=>{if(e.isIntersecting){e.target.classList.add('in-view');observer.unobserve(e.target);}});},{threshold:.06,rootMargin:'0px 0px -25px 0px'});}document.querySelectorAll('.reveal:not(.in-view)').forEach(e=>observer.observe(e));}
+  function updateArtParallax(){if(reduceMotion||currentView!=='homeView')return;const el=$('aboutSection'),r=el.getBoundingClientRect();if(r.bottom<0||r.top>innerHeight)return;const progress=clamp((innerHeight-r.top)/(innerHeight+r.height),0,1);$('aboutArt').style.translate=`0 ${(0.5-progress)*36}px`;}
+
+  // One immutable reference recording, loaded through a static manifest generated by
+  // prepare_recording.py. Raw samples are continuous, never epochized in this viewer.
+  const BANDS = {broad:null,delta:[.5,4],theta:[4,8],alpha:[8,13],beta:[13,30],low_gamma:[30,45]};
+  let activeBand='broad';
+  const eegChannels=()=>eeg.channels.filter(c=>eeg.active.has(c));
+  const refData={manifest:null,values:null};
+  let filteredCache=new Map();
+  function eegValue(t,ch){
+    const r=refData.manifest,values=refData.values;if(!r||!values)return 0;
+    const i=clamp(Math.floor(t*r.sample_rate_hz),0,r.n_samples-1);
+    return values[i*r.n_channels+eeg.channels.indexOf(ch)]||0;
+  }
+  function updateChannels(){const el=$('channelList');el.replaceChildren();for(const ch of eeg.channels){const b=document.createElement('button');b.type='button';b.className='channel-chip'+(eeg.active.has(ch)?' active':'');b.setAttribute('aria-pressed',String(eeg.active.has(ch)));b.innerHTML='<span></span><span></span>';b.firstChild.textContent=ch;b.lastChild.textContent=eeg.active.has(ch)?'●':'○';b.onclick=()=>{if(eeg.active.has(ch)&&eeg.active.size>1)eeg.active.delete(ch);else eeg.active.add(ch);updateChannels();drawEEG();};el.append(b);} $('channelCount').textContent=`${String(eeg.active.size).padStart(2,'0')} / ${String(eeg.channels.length).padStart(2,'0')}`;}
+  function getState(t){const r=refData.manifest;if(!r)return'RECORDING OVERVIEW';if((r.events||[]).some(e=>t>=e.start_s&&t<e.end_s))return'ICTAL · ANNOTATED';if((r.preictal_regions||[]).some(e=>t>=e.start_s&&t<e.end_s))return'BEFORE SEIZURE · 2-MIN CONTEXT';return'ONGOING EEG';}
+  function updateTimelineUI(){eeg.span=clamp(eeg.span,Math.min(1,eeg.duration),Math.max(1,eeg.duration));eeg.start=clamp(eeg.start,0,Math.max(0,eeg.duration-eeg.span));$('windowLabel').textContent=`${durationString(eeg.start)} — ${durationString(eeg.start+eeg.span)}`;$('zoomLabel').textContent=eeg.span<60?`${eeg.span.toFixed(eeg.span<10?1:0)}s`:`${Math.round(eeg.span/60)}m`;$('timelineInput').max=String(Math.max(0,eeg.duration-eeg.span));$('timelineInput').value=String(eeg.start);$('currentState').textContent=getState(eeg.start+eeg.span/2);}
+  function renderEvents(){const el=$('segments');el.replaceChildren();const r=refData.manifest;if(!r)return;const all=[...(r.preictal_regions||[]),...(r.events||[])].sort((a,b)=>a.start_s-b.start_s);for(const [i,e] of all.entries()){const b=document.createElement('button');b.dataset.eventType=e.type;b.textContent=`${e.type==='ictal'?'Seizure':'Before seizure'} ${durationString(e.start_s)}`;b.title=e.source||'';b.onclick=()=>{eeg.start=clamp(e.start_s-(eeg.span*.15),0,eeg.duration-eeg.span);updateTimelineUI();drawEEG();};el.append(b);}if(!all.length){el.textContent='Explore continuous activity and its annotated events.';}}
+  function updateSourceUI(){const r=refData.manifest;for(const id of ['timelineInput','gainInput','backWindow','playWindow','forwardWindow','zoomOut','zoomIn','zoomFull','resetChannels','metricChannel'])$(id).disabled=!r;document.querySelectorAll('[data-band]').forEach(b=>b.disabled=!r);$('datasetTitle').textContent=r?'EEG FROM A PATIENT WITH EPILEPSY':'EEG REFERENCE RECORDING';$('sourceTag').textContent=r?'PROCESSED EEG · ANNOTATED':'RESEARCH EEG';$('sourceDuration').textContent=r?`${durationString(eeg.duration)} · ${r.n_channels} channels`:'10-minute EEG example';$('timelineEnd').textContent=r?durationString(eeg.duration):'—';$('recordingMode').textContent=r?'Temple University Hospital EEG Corpus · normalized units':'EEG research showcase';$('eventLabel').textContent=r?`${(r.events||[]).length} annotated seizures`:'Annotations —';$('recordingStatus').textContent=r?`${r.n_channels} electrodes · ${r.sample_rate_hz} Hz · processed recording`:'Explore the model recording and its annotated event.';updateChannels();updateTimelineUI();renderEvents();updateStats();drawEEG();}
+  // Display-only two-biquad bandpass with forward-backward application and temporal padding.
+  // This intentionally does NOT replace Python/Scipy-based full-record Welch statistics.
+  function biquad(samples,fs,freq,mode){const f=Math.min(fs*.495,Math.max(.01,freq));const cos=Math.cos(2*Math.PI*f/fs),sin=Math.sin(2*Math.PI*f/fs),Q=Math.SQRT1_2,alpha=sin/(2*Q);let b0,b1,b2;if(mode==='high'){b0=(1+cos)/2;b1=-(1+cos);b2=b0;}else{b0=(1-cos)/2;b1=1-cos;b2=b0;}const a0=1+alpha,a1=-2*cos,a2=1-alpha,co=[b0/a0,b1/a0,b2/a0,a1/a0,a2/a0];const out=new Float32Array(samples.length);let x1=0,x2=0,y1=0,y2=0;for(let i=0;i<samples.length;i++){let x=samples[i];let y=co[0]*x+co[1]*x1+co[2]*x2-co[3]*y1-co[4]*y2;out[i]=y;x2=x1;x1=x;y2=y1;y1=y;}return out;}
+  function bandFilteredView(ch){const r=refData.manifest;if(!r||!BANDS[activeBand]||eeg.span>160)return null;
+    const key=[ch,activeBand,Math.round(eeg.start*5)/5,eeg.span].join('|');if(filteredCache.has(key))return filteredCache.get(key);
+    const fs=r.sample_rate_hz,pad=Math.min(8,Math.max(3,6/BANDS[activeBand][0])),i0=Math.max(0,Math.floor((eeg.start-pad)*fs)),i1=Math.min(r.n_samples,Math.ceil((eeg.start+eeg.span+pad)*fs)),ci=eeg.channels.indexOf(ch);let vals=new Float32Array(i1-i0);for(let i=i0;i<i1;i++)vals[i-i0]=refData.values[i*r.n_channels+ci];const [lo,hi]=BANDS[activeBand];
+    for(let k=0;k<2;k++){vals=biquad(vals,fs,lo,'high');vals=biquad(vals,fs,hi,'low');}vals.reverse();for(let k=0;k<2;k++){vals=biquad(vals,fs,lo,'high');vals=biquad(vals,fs,hi,'low');}vals.reverse();let result={values:vals,first:i0};
+    if(filteredCache.size>48)filteredCache.clear();filteredCache.set(key,result);return result;
+  }
+  function drawEEG(){const s=fitCanvas($('eegCanvas'));if(!s)return;const{ctx,w,h}=s;ctx.fillStyle='#070b0e';ctx.fillRect(0,0,w,h);const r=refData.manifest;if(!r||!refData.values){ctx.fillStyle='#9bb7c7';ctx.font='17px Arial';ctx.textAlign='center';ctx.fillText('Loading reference EEG…',w/2,h/2-13);ctx.font='13px Arial';ctx.fillStyle='#6b8496';ctx.fillText('Explore the signal and its annotations.',w/2,h/2+16);ctx.textAlign='start';return;}
+    const ml=w<460?44:67,mr=20,mt=27,mb=32,pw=w-ml-mr,ph=h-mt-mb,names=eegChannels(),n=names.length;if(pw<10||ph<10||!n)return;const t0=eeg.start,t1=t0+eeg.span;
+    for(const e of [...(r.preictal_regions||[]),...(r.events||[])]){const a=clamp((e.start_s-t0)/eeg.span,0,1),b=clamp((e.end_s-t0)/eeg.span,0,1);if(b>a){ctx.fillStyle=e.type==='ictal'?'rgba(0,152,255,.17)':'rgba(0,152,255,.058)';ctx.fillRect(ml+a*pw,mt,(b-a)*pw,ph);}if(e.start_s>=t0&&e.start_s<=t1){const x=ml+(e.start_s-t0)/eeg.span*pw;ctx.strokeStyle=e.type==='ictal'?'#0098ff':'rgba(255,255,255,.27)';ctx.setLineDash(e.type==='ictal'?[]:[4,4]);ctx.beginPath();ctx.moveTo(x,mt);ctx.lineTo(x,mt+ph);ctx.stroke();ctx.setLineDash([]);if(e.type==='ictal'){ctx.fillStyle='#59bfff';ctx.font='11px Arial';ctx.fillText('ONSET',x+4,17);}}}
+    ctx.strokeStyle='rgba(255,255,255,.09)';ctx.lineWidth=1;ctx.setLineDash([2,7]);for(let i=0;i<=5;i++){let x=ml+pw*i/5;ctx.beginPath();ctx.moveTo(x,mt);ctx.lineTo(x,h-mb);ctx.stroke();ctx.fillStyle='#829aab';ctx.font='11px Arial';ctx.fillText(durationString(t0+eeg.span*i/5),Math.min(x-14,w-53),h-10);}ctx.setLineDash([]);
+    const row=ph/n,fs=r.sample_rate_hz,C=r.n_channels;for(let j=0;j<n;j++){const ch=names[j],ci=eeg.channels.indexOf(ch),base=mt+(j+.5)*row,bf=bandFilteredView(ch);ctx.strokeStyle='rgba(255,255,255,.13)';ctx.beginPath();ctx.moveTo(ml,base);ctx.lineTo(w-mr,base);ctx.stroke();ctx.fillStyle=j===0?'#0098ff':'#bdced9';ctx.font='12px Arial';ctx.fillText(ch.slice(0,7),6,base+4);const sampleValue=i=>{i=clamp(i,0,r.n_samples-1);return bf?(bf.values[i-bf.first]||0):(refData.values[i*C+ci]||0);};let maxamp=r.processed?3.7:Math.max(.3, (r.statistics?.[ch]?.std||20)*4);const scale=Math.min(row*.42,45)/maxamp*eeg.gain;
+      const lo=Math.floor(t0*fs),hi=Math.min(r.n_samples-1,Math.ceil(t1*fs));ctx.strokeStyle=j===0?'#0098ff':'rgba(230,239,247,.85)';ctx.lineWidth=j===0?1.4:1;const pixels=Math.max(50,Math.floor(pw));if(hi-lo>pixels*2){ctx.beginPath();for(let px=0;px<=pixels;px++){const a=lo+Math.floor((hi-lo)*px/pixels),b=Math.min(hi,lo+Math.ceil((hi-lo)*(px+1)/pixels));let mn=Infinity,mx=-Infinity;for(let z=a;z<=b;z++){const v=sampleValue(z);if(v<mn)mn=v;if(v>mx)mx=v;}const x=ml+px/pixels*pw;ctx.moveTo(x,clamp(base-mx*scale,mt+j*row+1,mt+(j+1)*row-1));ctx.lineTo(x,clamp(base-mn*scale,mt+j*row+1,mt+(j+1)*row-1));}ctx.stroke();}else{ctx.beginPath();let points=Math.min(pixels*2,hi-lo);for(let px=0;px<=points;px++){const idx=lo+Math.round((hi-lo)*px/points),v=sampleValue(idx),x=ml+px/points*pw,y=clamp(base-v*scale,mt+j*row+1,mt+(j+1)*row-1);if(px===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);}ctx.stroke();}}
+    if(eeg.cursor!==null&&eeg.cursor>=t0&&eeg.cursor<=t1){const x=ml+(eeg.cursor-t0)/eeg.span*pw;ctx.strokeStyle='#0098ff';ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(x,mt);ctx.lineTo(x,h-mb);ctx.stroke();}if(!eeg.cursor)drawEEGOverview();}
+  let overviewEnvelope=null;
+  function drawEEGOverview(){
+    const r=refData.manifest,v=refData.values,el=$('eegOverviewCanvas');if(!r||!v||!el)return;
+    const c=fitCanvas(el);if(!c)return;const {ctx,w,h}=c;
+    if(!overviewEnvelope){
+      const count=1200,mins=new Float32Array(count),maxs=new Float32Array(count),step=Math.ceil(r.n_samples/count);
+      for(let i=0;i<count;i++){let mn=Infinity,mx=-Infinity;const s=i*step,e=Math.min(r.n_samples,s+step);for(let j=s;j<e;j++){const x=v[j*r.n_channels];if(x<mn)mn=x;if(x>mx)mx=x;}mins[i]=isFinite(mn)?mn:0;maxs[i]=isFinite(mx)?mx:0;}
+      overviewEnvelope={mins,maxs,count};
+    }
+    ctx.fillStyle='#061018';ctx.fillRect(0,0,w,h);const ml=9,mr=9,mt=10,mb=12,pw=w-ml-mr,ph=h-mt-mb;
+    for(const e of [...(r.preictal_regions||[]),...(r.events||[])]){const a=clamp(e.start_s/eeg.duration,0,1),b=clamp(e.end_s/eeg.duration,0,1);ctx.fillStyle=e.type==='ictal'?'rgba(0,152,255,.25)':'rgba(0,152,255,.055)';ctx.fillRect(ml+a*pw,mt,(b-a)*pw,ph);}
+    ctx.lineWidth=1;ctx.strokeStyle='rgba(198,223,238,.66)';ctx.beginPath();const {mins,maxs,count}=overviewEnvelope;
+    for(let i=0;i<count;i++){const x=ml+i/(count-1)*pw;ctx.moveTo(x,mt+ph/2-clamp(maxs[i]/8,-1,1)*ph*.42);ctx.lineTo(x,mt+ph/2-clamp(mins[i]/8,-1,1)*ph*.42);}ctx.stroke();
+    const a=clamp(eeg.start/eeg.duration,0,1),b=clamp((eeg.start+eeg.span)/eeg.duration,0,1);
+    ctx.fillStyle='rgba(0,152,255,.075)';ctx.fillRect(ml+a*pw,mt,Math.max(2,(b-a)*pw),ph);
+    ctx.strokeStyle='#0098ff';ctx.lineWidth=2;ctx.strokeRect(ml+a*pw+.5,mt+.5,Math.max(2,(b-a)*pw)-1,ph-1);
+    ctx.fillStyle='#94abb8';ctx.font='11px Arial';ctx.fillText('00:00',ml,h-1);ctx.fillText(durationString(r.duration_s),Math.max(ml,w-65),h-1);
+  }
+  function stopPlayback(){if(eeg.playTimer)clearInterval(eeg.playTimer);eeg.playing=false;eeg.playTimer=null;$('playWindow').textContent='▶';}
+  function drawPSD(){const c=$('psdCanvas'),s=fitCanvas(c);if(!s)return;const{ctx,w,h}=s;ctx.fillStyle='#08111b';ctx.fillRect(0,0,w,h);const r=refData.manifest,ch=$('metricChannel').value,spec=r?.spectra?.[ch];if(!spec)return;const pl=55,pr=17,pt=24,pb=30,pw=w-pl-pr,ph=h-pt-pb,limit=Math.min(45,r.sample_rate_hz/2);const f=spec.freqs_hz,p=spec.psd;let db=p.map(v=>10*Math.log10(Math.max(v,1e-14)));let sel=f.map((v,i)=>v<=limit?db[i]:null).filter(v=>v!==null);const min=Math.floor((Math.min(...sel)-3)/10)*10,max=Math.ceil((Math.max(...sel)+3)/10)*10;const yy=v=>pt+ph*(1-(v-min)/Math.max(1,max-min));ctx.fillStyle='rgba(0,152,255,.12)';if(BANDS[activeBand]){const [a,b]=BANDS[activeBand];ctx.fillRect(pl+a/limit*pw,pt,(Math.min(limit,b)-a)/limit*pw,ph);}ctx.strokeStyle='rgba(255,255,255,.1)';ctx.fillStyle='#92a9b8';ctx.font='11px Arial';for(let x=0;x<=limit;x+=10){const xx=pl+x/limit*pw;ctx.beginPath();ctx.moveTo(xx,pt);ctx.lineTo(xx,pt+ph);ctx.stroke();ctx.fillText(x+' Hz',xx-10,h-8);}for(let v=min;v<=max;v+=10){const y=yy(v);ctx.beginPath();ctx.moveTo(pl,y);ctx.lineTo(w-pr,y);ctx.stroke();ctx.fillText(v+' dB',5,y+4);}ctx.strokeStyle='#0098ff';ctx.lineWidth=1.7;ctx.beginPath();for(let i=0,k=0;i<f.length&&f[i]<=limit;i++){const x=pl+f[i]/limit*pw,y=yy(db[i]);if(k++===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);}ctx.stroke();}
+  // A scalp map visualizes descriptive channel-space features, not source localization.
+  // Relative powers and spectral centroids are derived from the same Welch PSD as the plot.
+  const scalpPositions={FP1:[-.33,.81],FP2:[.33,.81],F7:[-.77,.51],F3:[-.35,.48],FZ:[0,.49],F4:[.35,.48],F8:[.77,.51],T3:[-.92,.04],C3:[-.43,.04],CZ:[0,.04],C4:[.43,.04],T4:[.92,.04],T5:[-.76,-.54],P3:[-.36,-.47],PZ:[0,-.49],P4:[.36,-.47],T6:[.76,-.54],O1:[-.33,-.83],O2:[.33,-.83]};
+  const spectralFeatureCache=new Map();let scalpHitTargets=[];
+  function spectralFeatures(ch){
+    if(spectralFeatureCache.has(ch))return spectralFeatureCache.get(ch);
+    const spec=refData.manifest?.spectra?.[ch];if(!spec)return null;
+    const f=spec.freqs_hz,p=spec.psd;let total=0,weighted=0;
+    const integrals={delta:0,theta:0,alpha:0,beta:0,low_gamma:0};
+    for(let i=1;i<f.length;i++){
+      const mid=(f[i-1]+f[i])/2;if(mid<.5||mid>45)continue;
+      const df=f[i]-f[i-1],area=(p[i-1]+p[i])*.5*df;
+      total+=area;weighted+=area*mid;
+      for(const [band,limits] of Object.entries(BANDS)){if(!limits)continue;const [lo,hi]=limits;if(mid>=lo&&mid<hi)integrals[band]+=area;}
+    }
+    const bands=Object.fromEntries(Object.entries(integrals).map(([name,area])=>[name,total>0?100*area/total:0]));
+    const value={centroid:total>0?weighted/total:0,bands};spectralFeatureCache.set(ch,value);return value;
+  }
+  function scalpScale(){const ch=eeg.channels.filter(c=>scalpPositions[c]);const points=ch.map(c=>({channel:c,value:(activeBand==='broad'?spectralFeatures(c)?.centroid:spectralFeatures(c)?.bands?.[activeBand])??0,pos:scalpPositions[c]}));const vals=points.map(p=>p.value);const min=Math.min(...vals),max=Math.max(...vals);return {points,min,max};}
+  function spectralColor(t){t=clamp(t,0,1);const a=[10,31,47],b=[0,152,255],c=[218,245,255];const r=t<.72?t/.72:(t-.72)/.28;const v0=t<.72?a:b,v1=t<.72?b:c;return v0.map((n,i)=>Math.round(n+(v1[i]-n)*r));}
+  function drawTopomap(){
+    const el=$('topomapCanvas'),s=fitCanvas(el);if(!s)return;
+    const {ctx,w,h}=s;ctx.clearRect(0,0,w,h);scalpHitTargets=[];
+    const r=refData.manifest;if(!r||!eeg.channels.length)return;
+    const {points,min,max}=scalpScale();if(!points.length)return;
+    const cx=w/2,cy=h*.52,radius=Math.min(w*.37,h*.40,165),xrad=radius;
+    const img=document.createElement('canvas');img.width=150;img.height=150;const k=img.getContext('2d');const pix=k.createImageData(150,150);
+    for(let j=0;j<150;j++)for(let i=0;i<150;i++){
+      const px=(i-74.5)/74.5,py=(74.5-j)/74.5,idx=(j*150+i)*4;if(px*px+py*py>1)continue;
+      let num=0,den=0;for(const entry of points){const dx=px-entry.pos[0],dy=py-entry.pos[1];const d2=dx*dx+dy*dy;const wt=1/Math.max(.009,d2)**1.25;num+=wt*entry.value;den+=wt;}
+      const val=num/Math.max(den,1e-9),t=(val-min)/(max-min||1);const [red,green,blue]=spectralColor(t);
+      pix.data[idx]=red;pix.data[idx+1]=green;pix.data[idx+2]=blue;pix.data[idx+3]=255;
+    }
+    k.putImageData(pix,0,0);
+    ctx.save();ctx.beginPath();ctx.arc(cx,cy,radius,0,Math.PI*2);ctx.clip();ctx.fillStyle='#081b2a';ctx.fillRect(cx-radius,cy-radius,radius*2,radius*2);ctx.drawImage(img,cx-radius,cy-radius,2*radius,2*radius);ctx.restore();
+    ctx.strokeStyle='rgba(218,239,251,.72)';ctx.lineWidth=1.45;ctx.beginPath();ctx.arc(cx,cy,radius,0,Math.PI*2);ctx.stroke();
+    // Stylized nose and ears provide head orientation; positions follow approximate 10-20 layout.
+    ctx.beginPath();ctx.moveTo(cx-radius*.18,cy-radius*.985);ctx.lineTo(cx,cy-radius*1.16);ctx.lineTo(cx+radius*.18,cy-radius*.985);ctx.stroke();
+    ctx.beginPath();ctx.ellipse(cx-radius*1.025,cy,radius*.095,radius*.27,0,Math.PI/2,Math.PI*1.5);ctx.ellipse(cx+radius*1.025,cy,radius*.095,radius*.27,0,-Math.PI/2,Math.PI/2);ctx.stroke();
+    const picked=$('metricChannel')?.value;const labelFont=Math.max(9,Math.min(12,radius*.10));
+    for(const pt of points){const x=cx+pt.pos[0]*xrad*.92,y=cy-pt.pos[1]*xrad*.92,selected=pt.channel===picked;scalpHitTargets.push({x,y,ch:pt.channel});
+      ctx.beginPath();ctx.arc(x,y,selected?7:4.4,0,Math.PI*2);ctx.fillStyle=selected?'#fff':'#091a25';ctx.fill();ctx.strokeStyle=selected?'#fff':'rgba(218,241,255,.85)';ctx.lineWidth=selected?2:1.15;ctx.stroke();
+      ctx.font=`${selected?'bold ':''}${labelFont}px Arial`;ctx.textAlign='center';ctx.fillStyle=selected?'#fff':'#d8e9f4';ctx.shadowColor='rgba(0,0,0,.95)';ctx.shadowBlur=5;ctx.fillText(pt.channel,x,y-11);ctx.shadowBlur=0;
+    }
+    ctx.textAlign='center';ctx.fillStyle='#a6c1d2';ctx.font='10px Arial';ctx.fillText('FRONT',cx,cy-radius*1.19-7);
+    const unit=activeBand==='broad'?' Hz':'%';const digits=activeBand==='broad'?1:1;
+    $('topoLegendMin').textContent=min.toFixed(digits)+unit;$('topoLegendMax').textContent=max.toFixed(digits)+unit;
+    $('topoMode').textContent=activeBand==='broad'?'BROADBAND':activeBand.replace('_',' ').toUpperCase();
+    const selection=points.find(p=>p.channel===picked);
+    $('topoMetricLabel').textContent=activeBand==='broad'?'Mean spectral frequency · '+(picked||''):'Relative '+activeBand.replace('_',' ')+' power · '+(picked||'');
+    $('topoSelectedValue').textContent=selection?selection.value.toFixed(digits)+unit:'—';
+    $('topoExplanation').textContent=activeBand==='broad'?'Mean spectral frequency (0.5–45 Hz) for each channel, derived from its full-recording PSD. Electrode-space interpolation; not a map of cortical sources.':'Relative power in the selected band as a percentage of 0.5–45 Hz power. Electrode-space interpolation; not a map of cortical sources.';
+  }
+  function updateStats(){
+    const r=refData.manifest,select=$('metricChannel');if(!r){select.replaceChildren();drawPSD();drawTopomap();return;}
+    const prev=select.value;select.replaceChildren(...eeg.channels.map(ch=>new Option(ch,ch)));if(eeg.channels.includes(prev))select.value=prev;
+    const ch=select.value;const spec=spectralFeatures(ch);
+    const bp=$('bandPowerList');bp.replaceChildren();for(const [key,value] of Object.entries(spec?.bands||{})){
+      const b=document.createElement('button');b.type='button';b.className='power-band'+(activeBand===key?' active':'');
+      const label=document.createElement('span');label.textContent=key.replace('_',' ');
+      const amount=document.createElement('strong');amount.textContent=value.toFixed(1)+'%';b.append(label,amount);b.onclick=()=>chooseBand(key);bp.append(b);
+    }
+    drawPSD();drawTopomap();
+  }
+  function chooseBand(band){activeBand=band;document.querySelectorAll('[data-band]').forEach(b=>b.classList.toggle('active',b.dataset.band===band));filteredCache.clear();updateStats();drawEEG();}
+  // A browser can fetch the binary recording over HTTP. When index.html is opened
+  // directly from disk (file://), browsers disallow fetch(), so load the same
+  // recording through a local script. This keeps the specimen identical offline.
+  function loadLocalEEGScript(){return new Promise((resolve,reject)=>{
+    if(window.DIFASE_EEG_INLINE){resolve();return;}
+    const script=document.createElement('script');
+    script.src='data/recording-inline.js';
+    script.onload=resolve;
+    script.onerror=()=>reject(new Error('The reference recording asset could not be loaded'));
+    document.head.appendChild(script);
+  });}
+  async function readLocalEEG(){
+    await loadLocalEEGScript();
+    const bundled=window.DIFASE_EEG_INLINE;
+    if(!bundled||!bundled.manifest||!Array.isArray(bundled.chunks))throw Error('Invalid bundled EEG');
+    const r=bundled.manifest;
+    const expected=r.n_samples*r.n_channels*4;
+    const bytes=new Uint8Array(expected);let offset=0;
+    for(const chunk of bundled.chunks){const part=atob(chunk);for(let i=0;i<part.length;i++)bytes[offset+i]=part.charCodeAt(i);offset+=part.length;}
+    if(offset!==expected)throw Error('Bundled EEG size mismatch');
+    delete window.DIFASE_EEG_INLINE;
+    return {r,buf:bytes.buffer};
+  }
+  async function readReferenceEEG(){
+    if(location.protocol==='file:')return readLocalEEG();
+    try{
+      const resp=await fetch('data/recording.json',{cache:'no-store'});
+      if(!resp.ok)throw Error('Reference EEG metadata request failed');
+      const r=await resp.json();
+      const file=await fetch('data/'+r.data_file,{cache:'no-store'});
+      if(!file.ok)throw Error('Reference EEG signal request failed');
+      return {r,buf:await file.arrayBuffer()};
+    }catch(error){console.warn('Direct EEG loading failed; trying bundled copy.',error);return readLocalEEG();}
+  }
+  async function loadReference(){try{
+    const {r,buf}=await readReferenceEEG();
+    if(r.schema_version!==1||!r.data_file||r.n_channels<1||r.n_samples<1)throw Error('Invalid reference EEG metadata');
+    if(buf.byteLength!==r.n_samples*r.n_channels*4)throw Error('Reference EEG size mismatch');
+    refData.manifest=r;refData.values=new Float32Array(buf);
+eeg.channels=r.channels;eeg.active=new Set(r.channels);eeg.duration=r.duration_s;eeg.span=Math.min(30,r.duration_s);eeg.start=(r.events?.length?clamp(r.events[0].start_s-eeg.span*.75,0,Math.max(0,eeg.duration-eeg.span)):0);eeg.gain=1;eeg.mode='recording';$('dataProvenance').textContent='This annotated example is derived from the Temple University Hospital EEG Epilepsy Corpus. Its signal has been filtered to 0.5–45 Hz and normalized channel by channel for consistent exploration. The seizure is marked using the dataset annotations; the two minutes before its onset are highlighted as an illustrative pre-seizure context. Those two minutes are not a separate clinical annotation.';$('preprocessingSteps').replaceChildren(...['256 samples / second','0.5–45 Hz frequency range','Processed and normalized EEG','Full recording'].map(t=>{const span=document.createElement('span');span.textContent=t;return span;}));updateSourceUI();}catch(err){console.error('DIFASE EEG data load:',err);updateSourceUI();}}
+  function bindEEG(){const move=()=>{updateTimelineUI();filteredCache.clear();drawEEG();};$('resetChannels').onclick=()=>{eeg.active=new Set(eeg.channels);updateChannels();drawEEG();};$('gainInput').oninput=e=>{eeg.gain=+e.target.value;$('gainValue').textContent=eeg.gain.toFixed(1)+'×';drawEEG();};$('timelineInput').oninput=e=>{eeg.start=+e.target.value;move();};$('backWindow').onclick=()=>{eeg.start-=eeg.span*.5;move();};$('forwardWindow').onclick=()=>{eeg.start+=eeg.span*.5;move();};$('zoomIn').onclick=()=>{const mid=eeg.start+eeg.span/2;eeg.span=Math.max(.25,eeg.span/1.7);eeg.start=mid-eeg.span/2;move();};$('zoomOut').onclick=()=>{const mid=eeg.start+eeg.span/2;eeg.span=Math.min(eeg.duration,eeg.span*1.7);eeg.start=mid-eeg.span/2;move();};$('zoomFull').onclick=()=>{eeg.span=eeg.duration;eeg.start=0;move();};$('playWindow').onclick=()=>{if(eeg.playing){stopPlayback();return;}eeg.playing=true;$('playWindow').textContent='Ⅱ';let last=performance.now();eeg.playTimer=setInterval(()=>{const now=performance.now();eeg.start+=(now-last)*.003;last=now;if(eeg.start+eeg.span>=eeg.duration)eeg.start=0;move();},110);};const overview=$('eegOverviewCanvas');overview.addEventListener('click',e=>{if(!refData.manifest)return;const rect=overview.getBoundingClientRect();const f=clamp((e.clientX-rect.left-9)/(rect.width-18),0,1);eeg.start=clamp(f*eeg.duration-eeg.span/2,0,Math.max(0,eeg.duration-eeg.span));move();});const canvas=$('eegCanvas');canvas.addEventListener('mousemove',e=>{const rect=canvas.getBoundingClientRect(),ml=rect.width<460?44:67,pw=rect.width-ml-20;eeg.cursor=clamp(eeg.start+(e.clientX-rect.left-ml)/pw*eeg.span,eeg.start,eeg.start+eeg.span);$('waveformHud').textContent='Cursor '+durationString(eeg.cursor);$('cursorTimeLabel').textContent='Cursor '+durationString(eeg.cursor);drawEEG();});canvas.addEventListener('mouseleave',()=>{eeg.cursor=null;drawEEG();});canvas.addEventListener('wheel',e=>{if(!e.ctrlKey)return;e.preventDefault();const mid=eeg.start+eeg.span/2;eeg.span=clamp(eeg.span*(e.deltaY>0?1.2:.83),.25,eeg.duration);eeg.start=mid-eeg.span/2;move();},{passive:false});$('metricChannel').addEventListener('change',()=>{drawPSD();drawTopomap();}); const scalp=$('topomapCanvas');scalp.addEventListener('click',e=>{const r=scalp.getBoundingClientRect();const x=e.clientX-r.left,y=e.clientY-r.top;const nearest=scalpHitTargets.map(p=>({...p,d:Math.hypot(p.x-x,p.y-y)})).sort((p,q)=>p.d-q.d)[0];if(nearest&&nearest.d<25){$('metricChannel').value=nearest.ch;drawPSD();drawTopomap();}});scalp.addEventListener('mousemove',e=>{const r=scalp.getBoundingClientRect();const near=scalpHitTargets.some(p=>Math.hypot(p.x-(e.clientX-r.left),p.y-(e.clientY-r.top))<24);scalp.style.cursor=near?'pointer':'default';});scalp.addEventListener('keydown',e=>{if(!['ArrowRight','ArrowLeft'].includes(e.key)||!eeg.channels.length)return;e.preventDefault();const select=$('metricChannel'),step=e.key==='ArrowRight'?1:-1;select.value=eeg.channels[(eeg.channels.indexOf(select.value)+step+eeg.channels.length)%eeg.channels.length];drawPSD();drawTopomap();});document.querySelectorAll('[data-band]').forEach(b=>b.onclick=()=>chooseBand(b.dataset.band));updateSourceUI();loadReference();}
+
+  // A mathematically valid marginal noising illustration, with a smooth illustrative noise schedule.
+  function makeGaussian(n,seed){let s=seed>>>0;const rnd=()=>{s=(1664525*s+1013904223)>>>0;return(s+.5)/4294967296;};const arr=[];for(let i=0;i<n;i++){const a=Math.max(1e-8,rnd()),b=rnd();arr.push(Math.sqrt(-2*Math.log(a))*Math.cos(2*Math.PI*b));}return arr;}
+  const N=1000,noiseWhite=makeGaussian(N,25721),noiseOU=(()=>{const a=[],r=.967;let x=0;for(const v of noiseWhite){x=r*x+Math.sqrt(1-r*r)*v;a.push(x);}return a;})();let diffValue=320,diffMode='white';
+  function cleanSample(i){const t=i/N*3.2;return .52*Math.sin(2*Math.PI*8.2*t)+.27*Math.sin(2*Math.PI*2.9*t+.2)+.17*Math.sin(2*Math.PI*14.3*t+1.2);}
+  function drawDiffusionCanvas(id,noisy){const s=fitCanvas($(id));if(!s)return;const{ctx,w,h}=s;ctx.fillStyle='#070d12';ctx.fillRect(0,0,w,h);const l=7,t=12,pw=w-15,ph=h-25;ctx.strokeStyle='rgba(255,255,255,.1)';ctx.lineWidth=.8;for(let y=t;y<h-5;y+=32){ctx.beginPath();ctx.moveTo(l,y);ctx.lineTo(w-8,y);ctx.stroke();}for(let x=l;x<w-8;x+=60){ctx.beginPath();ctx.moveTo(x,t);ctx.lineTo(x,h-12);ctx.stroke();}
+    const progress=diffValue/1000,alpha=clamp(Math.cos(progress*Math.PI/2)**2,0,1),eps=diffMode==='white'?noiseWhite:noiseOU;ctx.strokeStyle=noisy?'#0098ff':'#f5f8fb';ctx.lineWidth=1.5;ctx.beginPath();for(let i=0;i<N;i++){const x=l+pw*i/(N-1),v=cleanSample(i),out=noisy?Math.sqrt(alpha)*v+Math.sqrt(1-alpha)*eps[i]:v,y=t+ph/2-clamp(out,-2.5,2.5)*ph*.3;if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);}ctx.stroke();}
+  function updateDiffusion(){diffValue=+$('diffusionSlider').value;$('diffusionValue').textContent=String(diffValue);drawDiffusionCanvas('cleanCanvas',false);drawDiffusionCanvas('noisyCanvas',true);}
+  let diffPlaying=false,diffRaf=null,diffLast=0,diffHold=0;
+  function stopDiffusionPlayback(){diffPlaying=false;if(diffRaf!==null){cancelAnimationFrame(diffRaf);diffRaf=null;}const b=$('diffusionPlay');b.setAttribute('aria-pressed','false');b.setAttribute('aria-label','Play diffusion animation');b.querySelector('.diff-play-icon').textContent='▶';b.querySelector('.diff-play-label').textContent='Play animation';}
+  function animateDiffusion(now){
+    if(!diffPlaying)return;
+    if(!diffLast)diffLast=now;const dt=Math.min(65,now-diffLast);diffLast=now;
+    if(diffHold){diffHold+=dt;if(diffHold>=440){diffHold=0;diffValue=0;$('diffusionSlider').value='0';updateDiffusion();}}
+    else {diffValue=Math.min(1000,diffValue+dt*.14);$('diffusionSlider').value=String(Math.round(diffValue));updateDiffusion();if(diffValue>=1000)diffHold=1;}
+    diffRaf=requestAnimationFrame(animateDiffusion);
+  }
+  function bindDiffusion(){
+    $('diffusionSlider').addEventListener('input',()=>{if(diffPlaying)stopDiffusionPlayback();updateDiffusion();});
+    $('diffusionPlay').onclick=()=>{if(diffPlaying){stopDiffusionPlayback();return;}if(+$('diffusionSlider').value>=1000){$('diffusionSlider').value='0';}diffValue=+$('diffusionSlider').value;diffPlaying=true;diffLast=0;diffHold=0;const b=$('diffusionPlay');b.setAttribute('aria-pressed','true');b.setAttribute('aria-label','Pause diffusion animation');b.querySelector('.diff-play-icon').textContent='Ⅱ';b.querySelector('.diff-play-label').textContent='Pause animation';diffRaf=requestAnimationFrame(animateDiffusion);};
+    document.querySelectorAll('[data-noise]').forEach(btn=>btn.addEventListener('click',()=>{diffMode=btn.dataset.noise;document.querySelectorAll('[data-noise]').forEach(b=>b.classList.toggle('active',b===btn));updateDiffusion();}));
+  }
+
+  // A guided, interactive interpretation of the published Vetter et al. architecture.
+  // Each stop in the guided experience corresponds to an actual component or process.
+  const architectureGuide = {
+    raw: {tag:'THE OBSERVATION',title:'Neural signal · x₀',symbol:'x₀ ∈ ℝ^(C×L)',type:'signal',
+      desc:'We begin with an observed segment of multichannel EEG. C describes the channels and L the samples in a training segment. The model learns from many such examples, while the EEG Explorer shows the entire clinical recording.',
+      insight:'Every synthetic trace should reproduce features of real recordings — across time, frequency, and channels.'},
+    noise: {tag:'VETTER · OPTIONAL ADAPTATION',title:'Choosing the noise',symbol:'ε ∼ 𝒩(0, Σ)',type:'noise',
+      desc:'Noise is introduced according to a defined probability distribution. In conventional DDPM implementations, samples are often corrupted with independent Gaussian noise. The published approach also examines temporally correlated Ornstein–Uhlenbeck noise.',
+      insight:'The noise model changes what kinds of temporal structures the network has to recover during training.',difference:'Vetter et al. compare white noise with an OU process. OU noise has temporal correlations, so adjacent samples are not independent; these are alternative choices, not two successive stages.'},
+    forward: {tag:'CORE DIFFUSION PROCESS',title:'Forward diffusion',symbol:'xₜ = √ᾱₜx₀ + √(1−ᾱₜ)ε',type:'steps',
+      desc:'A fixed schedule controls how the observed data is gradually perturbed. Training can sample a diffusion step t and directly form xₜ from the original x₀ and a sampled ε.',
+      insight:'The model learns to reverse a controlled corruption process — it never needs a separate neural network for forward noising.'},
+    noisy: {tag:'MODEL INPUT',title:'Noisy EEG · xₜ',symbol:'xₜ',type:'signal',
+      desc:'This is the EEG segment after noise has been added at a chosen diffusion step. The denoiser receives the noisy segment and its step index, which indicate both the observation and its current corruption level.',
+      insight:'Samples with different noise levels force the network to learn structure across a range of difficulties.'},
+    time: {tag:'TWO DISTINCT TIME VARIABLES',title:'Step index and conditioning',symbol:'t ≠ τ',type:'time',
+      desc:'The diffusion index t measures progress through the model’s noising/denoising procedure. An optional condition c can represent brain state or an experimental label, as demonstrated in the cited research. DIFASE proposes a separate variable τ: time until seizure onset.',
+      insight:'Changing the diffusion step t is not the same as moving closer to a seizure. They answer different scientific questions.'},
+    conv_in: {tag:'INSIDE THE DENOISER',title:'Input projection',symbol:'C → C · d',type:'layers',
+      desc:'A one-dimensional convolution maps the EEG channels to a higher-dimensional representation. This first stage prepares the signal for the deeper temporal and cross-channel transformations.',
+      insight:'The network expands its internal representation without downsampling the recording’s time axis.'},
+    long: {tag:'VETTER · ARCHITECTURE ADAPTATION',title:'Structured long convolutions',symbol:'h ⊛ k   (FFT)',type:'kernel',
+      desc:'Structured temporal kernels combine information at multiple scales. Their length can approach the length of the input segment, allowing interactions across much longer periods than short, conventional kernels. FFT-based convolution accelerates their application.',
+      insight:'Long-range relationships are essential for oscillatory and other temporally structured neural activity within the training segment.',difference:'Instead of relying on a conventional short-kernel CNN or U-Net-like denoiser, the paper uses long structured convolutions with an efficient multiscale parameterization.'},
+    gelu: {tag:'INSIDE THE DENOISER',title:'Activation & normalization',symbol:'GELU  +  Norm',type:'layers',
+      desc:'Nonlinear activations allow the representation to encode complex patterns, while normalization stabilizes intermediate activations. These transformations connect the model’s temporal and channel-mixing operations.',
+      insight:'Denoising complex physiological dynamics requires more than a purely linear filter.'},
+    mix: {tag:'VETTER · ARCHITECTURE ADAPTATION',title:'Cross-channel mixing',symbol:'h′ = W · h',type:'mix',
+      desc:'Long convolutions analyze time within hidden channels. Learnable linear layers then exchange information across hidden channels, allowing the denoiser to model relationships across recorded electrodes.',
+      insight:'Brain recordings are multivariate: what happens at one electrode may relate to activity at another.',difference:'Vetter et al. sparsify portions of the off-diagonal mixing weights. This reduces parameter growth and can help convergence for recordings with many channels.'},
+    conv_out: {tag:'INSIDE THE DENOISER',title:'Predicting the noise',symbol:'εθ(xₜ, t, c)',type:'layers',
+      desc:'The output projection maps the hidden features back to the signal dimensions. It estimates the corruption that was added to the noisy EEG, given the diffusion step and optional experimental condition.',
+      insight:'This prediction enables the iterative reconstruction steps of the generative model.'},
+    loss: {tag:'VETTER · NOISE-DEPENDENT OBJECTIVE',title:'Learning from prediction error',symbol:'(ε−εθ)ᵀΣ⁻¹(ε−εθ)',type:'loss',
+      desc:'During training the predicted noise is compared against the noise that was actually injected. Minimizing this error improves the denoiser’s ability to recover structured signals from varied corruption levels.',
+      insight:'A loss based on the known noise target provides direct supervision without manually annotating the desired generated waveforms.',difference:'With correlated Gaussian noise the objective can include its inverse covariance Σ⁻¹; this goes beyond the simple isotropic error used with white noise.'},
+    prior: {tag:'VETTER · OPTIONAL ADAPTATION',title:'Starting from noise',symbol:'xT ∼ 𝒩(0, Σ)',type:'noise',
+      desc:'Once training is complete, sampling begins from a random realization of the chosen prior. The reverse model then gradually turns this noise into a synthetic signal.',
+      insight:'Sampling is stochastic: different random seeds lead to different candidate EEG realizations.',difference:'When OU noise is used, the starting distribution is temporally correlated. With conventional white noise, Σ = I.'},
+    reverse: {tag:'GENERATIVE PROCESS',title:'Reverse diffusion',symbol:'pθ(xₜ₋₁ | xₜ)',type:'steps',
+      desc:'A trained denoiser informs each transition from a noisy sample to a slightly less noisy one. Repeating this process across diffusion steps gradually produces a waveform with learned neural-signal statistics.',
+      insight:'The same denoiser is reused iteratively; there is not a separately trained network for every reverse step.'},
+    generated: {tag:'GENERATED OUTPUT',title:'Synthetic EEG · x̂₀',symbol:'x̂₀',type:'signal',
+      desc:'After the reverse process, the output is a new simulated time series. Scientific quality is assessed using more than its appearance: frequency spectra, temporal structure, channel relationships and sample diversity all matter.',
+      insight:'A convincing trace is not automatically a faithful or clinically useful generative model.'},
+    applications: {tag:'FROM MODEL TO RESEARCH',title:'What can we investigate?',symbol:'pθ(x | c)',type:'mix',
+      desc:'The published work explores generation, missing-channel imputation, conditional synthesis and likelihood-based classification of brain states. This motivates the DIFASE research question: whether EEG distributions change systematically as a seizure approaches.',
+      insight:'Generative models offer a way to study changing signal distributions, not only to create plausible-looking samples.'}
+  };
+  const architectureOrder = ['raw','noise','forward','noisy','time','conv_in','long','gelu','mix','conv_out','loss','prior','reverse','generated','applications'];
+  function architectureMiniature(type){
+    const wave='<path class="mini-white" d="M10 74 Q24 74 31 49 T48 71 T63 51 T85 72 T106 50 T126 66 T154 39 T178 72 T199 47 T231 61 T251 33 T284 71 T317 43 T339 62"/>';
+    const smooth='<path class="mini-blue" d="M10 80 C44 80 37 28 76 32 S115 99 153 68 S205 20 235 60 S290 96 339 35"/>';
+    const grid='<path d="M10 32H340M10 58H340M10 84H340" class="mini-grid"/>';
+    const base='<svg viewBox="0 0 350 114" preserveAspectRatio="none" aria-hidden="true">'+grid;
+    if(type==='noise')return `<div class="mini-caption">WHITE NOISE / CORRELATED NOISE</div>${base}<path class="mini-white" d="M10 35 L17 73 25 31 32 66 41 25 50 81 58 35 65 74 73 29 81 61 90 32 97 84 104 45 112 25 120 60 129 32 138 83 146 34 153 68 162 27 170 85 180 34 187 71 197 26 206 85 215 36 225 72 235 30 245 90 256 39 265 68 275 34 284 82 293 42 302 76 315 31 327 75 340 48"/>${smooth}</svg>`;
+    if(type==='kernel')return `<div class="mini-caption">MULTISCALE TEMPORAL RECEPTIVE FIELD</div><div class="mini-kernel"><i></i><i></i><i></i><i></i><b>FFT</b></div>`;
+    if(type==='mix')return `<div class="mini-caption">CHANNELS EXCHANGING INFORMATION</div><div class="mini-mix">${[0,1,2,3].map(i=>`<span style="--i:${i}"></span>`).join('')}<div class="mini-mix-connect"></div>${[0,1,2,3].map(i=>`<span style="--i:${i}"></span>`).join('')}</div>`;
+    if(type==='layers')return `<div class="mini-caption">MULTICHANNEL FEATURE TRANSFORMATION</div><div class="mini-layers"><span></span><span></span><span></span><span></span><span></span></div>`;
+    if(type==='loss')return `<div class="mini-caption">NOISE ESTIMATE → TRAINING OBJECTIVE</div>${base}<path class="mini-blue" d="M9 20 C47 42 41 90 73 69 S114 52 133 74 S180 92 199 83 S234 85 258 90 S293 86 342 92"/></svg>`;
+    if(type==='time')return `<div class="mini-caption">DIFFUSION STEPS ARE NOT SEIZURE TIME</div><div class="mini-time"><span>t <i></i></span><span>τ <i></i></span></div>`;
+    if(type==='steps')return `<div class="mini-caption">ITERATIVE DIFFUSION TRANSITIONS</div><div class="mini-steps"><span>x₀</span><i></i><span>xₜ</span><i></i><span>xT</span></div>`;
+    return `<div class="mini-caption">ELECTROPHYSIOLOGICAL TIME SERIES</div>${base}${wave}${smooth}</svg>`;
+  }
+
+  function bindArchitecture(){
+    const svg=$('architectureSvg'),viewport=$('archViewport'),panel=$('archFocusPanel');
+    let view={x:0,y:0,w:1920,h:1160};let selected=null,raf=null;let pointer=null;
+    const ease=t=>1-Math.pow(1-t,3);
+    function setView(v){view={...v};svg.setAttribute('viewBox',`${view.x} ${view.y} ${view.w} ${view.h}`);}
+    function animateTo(target){if(raf)cancelAnimationFrame(raf);if(reduceMotion){setView(target);return;}const start={...view},t0=performance.now();const tick=now=>{const f=ease(Math.min(1,(now-t0)/880));setView({x:start.x+(target.x-start.x)*f,y:start.y+(target.y-start.y)*f,w:start.w+(target.w-start.w)*f,h:start.h+(target.h-start.h)*f});if(f<1)raf=requestAnimationFrame(tick);else raf=null;};raf=requestAnimationFrame(tick);}
+    const viewFull=()=>animateTo({x:0,y:0,w:1920,h:1160});
+    function focusToNode(n){
+      const r=n.querySelector('rect'),loc=/translate\(([-\d.]+)[, ]+([-\d.]+)\)/.exec(n.getAttribute('transform')||'');if(!r||!loc)return;
+      const cx=+loc[1]+(+r.getAttribute('width'))/2,cy=+loc[2]+(+r.getAttribute('height'))/2;
+      const small=viewport.clientWidth<720,w=small?690:860,h=w*Math.max(0.45,viewport.clientHeight/Math.max(1,viewport.clientWidth));
+      const tx=cx-(small?.5:.35)*w,ty=cy-(small?.25:.46)*h;
+      const next={x:clamp(tx,-40,1960-w),y:clamp(ty,-60,1220-h),w,h};animateTo(next);
+    }
+    const edges=[['raw','forward'],['forward','noisy'],['noise','forward'],['noisy','loss'],['conv_in','long'],['long','gelu'],['gelu','mix'],['mix','conv_out'],['prior','reverse'],['reverse','generated'],['generated','applications'],['noisy','conv_in'],['time','conv_in'],['conv_out','loss'],['noise','loss'],['conv_out','reverse']];
+    function markNetwork(key){const neighbours=new Set([key]);for(const [a,b] of edges)if(a===key||b===key){neighbours.add(a);neighbours.add(b);}document.querySelectorAll('[data-arch-node]').forEach(el=>{el.classList.toggle('selected',el.dataset.archNode===key);el.classList.toggle('is-neighbour',key!==null&&neighbours.has(el.dataset.archNode)&&el.dataset.archNode!==key);el.classList.toggle('is-softened',key!==null&&!neighbours.has(el.dataset.archNode));});document.querySelectorAll('.arch-wire').forEach((el,i)=>{const e=edges[i];el.classList.toggle('wire-active',!!(key&&e&&e.includes(key)));});}
+    function showNode(key){const n=svg.querySelector(`[data-arch-node="${key}"]`),g=architectureGuide[key];if(!n||!g)return;selected=key;markNetwork(key);focusToNode(n);
+      const i=architectureOrder.indexOf(key),number=String(i+1).padStart(2,'0'),total=architectureOrder.length;
+      $('archFocusCategory').textContent=g.tag;$('archFocusTitle').textContent=g.title;$('archFocusStep').textContent=`STAGE ${number} / ${total}`;$('archFocusCount').textContent=`${number} / ${total}`;
+      $('archFocusDescription').textContent=g.desc;$('archFocusInsight').textContent=g.insight;const adapted=n.classList.contains('is-adaptation');$('archFocusComparison').hidden=!adapted;$('archFocusDifference').textContent=adapted?g.difference:'';$('archFocusFormula').textContent=g.symbol;
+      $('archConceptIllustration').innerHTML=architectureMiniature(g.type);$('archFocusProgressFill').style.width=((i+1)/total*100).toFixed(1)+'%';
+      panel.hidden=false;panel.classList.remove('panel-enter');void panel.offsetHeight;panel.classList.add('panel-enter');$('archFocusScroll').scrollTop=0;
+      $('archPrevStep').disabled=i<=0;$('archNextStep').disabled=i>=total-1;
+    }
+    function reset(){selected=null;panel.hidden=true;markNetwork(null);viewFull();}
+    function stepBy(delta){if(!selected){showNode(architectureOrder[0]);return;}const i=architectureOrder.indexOf(selected);showNode(architectureOrder[clamp(i+delta,0,architectureOrder.length-1)]);}
+    svg.querySelectorAll('[data-arch-node]').forEach(el=>{el.addEventListener('click',()=>showNode(el.dataset.archNode));el.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();showNode(el.dataset.archNode);}});});
+    $('archTourStart').onclick=()=>{showNode(architectureOrder[0]);viewport.scrollIntoView({block:'center',behavior:reduceMotion?'instant':'smooth'});};
+    $('archFocusClose').onclick=reset;$('archPrevStep').onclick=()=>stepBy(-1);$('archNextStep').onclick=()=>stepBy(1);
+    $('archFit').onclick=reset;
+    $('archHighlight').onchange=e=>viewport.classList.toggle('highlight-adaptations',e.target.checked);
+    // Wheel scrolling behaves like a normal page. Zoom is reserved for focused steps.
+
+    viewport.addEventListener('pointerdown',e=>{if(e.button!==0||!selected||e.target.closest?.('.arch-node,.arch-focus-panel'))return;pointer={x:e.clientX,y:e.clientY,box:viewport.getBoundingClientRect(),vx:view.x,vy:view.y,vw:view.w,vh:view.h};viewport.setPointerCapture(e.pointerId);viewport.classList.add('dragging');});
+    viewport.addEventListener('pointermove',e=>{if(!pointer)return;if(raf){cancelAnimationFrame(raf);raf=null;}setView({x:pointer.vx-(e.clientX-pointer.x)/pointer.box.width*pointer.vw,y:pointer.vy-(e.clientY-pointer.y)/pointer.box.height*pointer.vh,w:pointer.vw,h:pointer.vh});});
+    const stop=()=>{pointer=null;viewport.classList.remove('dragging');};viewport.addEventListener('pointerup',stop);viewport.addEventListener('pointercancel',stop);
+    document.addEventListener('keydown',e=>{if(currentView!=='architectureView')return;if(e.key==='Escape'&&selected){reset();}else if(panel.hidden===false&&e.key==='ArrowRight'&&!e.target.matches('input'))stepBy(1);else if(panel.hidden===false&&e.key==='ArrowLeft'&&!e.target.matches('input'))stepBy(-1);});
+    setView(view);
+  }
+
+  // The cursor does not translate the waveforms. It locally amplifies their
+  // oscillations using a Gaussian envelope that follows the pointer smoothly.
+  const heroPointer={x:0,y:0,strength:0,lastFrame:0};
+  const heroTarget={x:0,y:0,strength:0};
+  let heroTimestamp=0;
+  function drawHero(now){
+    const el=$('heroCanvas'),s=fitCanvas(el);if(!s)return;
+    const {ctx,w,h}=s;
+    const elapsed=heroPointer.lastFrame?Math.min(now-heroPointer.lastFrame,120):16;
+    heroPointer.lastFrame=now;
+    const ease=1-Math.exp(-elapsed/160);
+    heroPointer.x+=(heroTarget.x-heroPointer.x)*ease;
+    heroPointer.y+=(heroTarget.y-heroPointer.y)*ease;
+    heroPointer.strength+=(heroTarget.strength-heroPointer.strength)*ease;
+    ctx.clearRect(0,0,w,h);
+    const center=h*.50,tm=now*.00023;
+    const spreadX=Math.max(75,Math.min(w*.12,175));
+    const spreadY=Math.max(100,h*.28);
+    for(let j=0;j<15;j++){
+      ctx.beginPath();
+      const amplitude=clamp(w*.052,24,95)*(1+.13*Math.sin(tm+j*.4));
+      const baseline=center+(j-7)*13; // Fixed: pointer never moves the baseline.
+      const verticalProximity=Math.exp(-.5*((baseline-heroPointer.y)/spreadY)**2);
+      const response=heroPointer.strength*(.19+.17*verticalProximity);
+      ctx.lineWidth=j===7?1.5:.85;
+      for(let x=0;x<=w;x+=4){
+        const u=x/w;
+        const envelope=.15+.85*Math.sin(Math.PI*u)**2;
+        const oscillation=Math.sin(u*14*Math.PI+tm*.8+j*.36)
+          +.42*Math.sin(u*44*Math.PI-tm*1.1+j*.8)
+          +.14*Math.sin(u*100*Math.PI+tm+j*.28);
+        const dx=(x-heroPointer.x)/spreadX;
+        const localBoost=1+response*Math.exp(-.5*dx*dx);
+        const y=baseline+oscillation*amplitude*envelope*localBoost;
+        if(x===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);
+      }
+      ctx.strokeStyle=j===7?'rgba(0,152,255,.68)':`rgba(215,233,248,${(.03+(1-Math.abs(j-7)/8)*.077).toFixed(3)})`;
+      ctx.stroke();
+    }
+    const gradient=ctx.createRadialGradient(w*.5,center,0,w*.5,center,w*.6);
+    gradient.addColorStop(0,'rgba(0,152,255,.045)');
+    gradient.addColorStop(1,'rgba(0,0,0,0)');
+    ctx.fillStyle=gradient;ctx.fillRect(0,0,w,h);
+  }
+  function animationLoop(now){
+    if(now-heroTimestamp>33&&currentView==='homeView'&&$('homeHero').getBoundingClientRect().bottom>0){drawHero(now);heroTimestamp=now;}
+    if(!reduceMotion)requestAnimationFrame(animationLoop);
+  }
+  function bindAnimations(){
+    const hero=$('homeHero'),canvas=$('heroCanvas');
+    hero.addEventListener('pointermove',e=>{
+      if(reduceMotion||e.pointerType==='touch')return;
+      const bounds=canvas.getBoundingClientRect();
+      if(heroTarget.strength===0){heroPointer.x=e.clientX-bounds.left;heroPointer.y=e.clientY-bounds.top;}
+      heroTarget.x=clamp(e.clientX-bounds.left,0,bounds.width);
+      heroTarget.y=clamp(e.clientY-bounds.top,0,bounds.height);
+      heroTarget.strength=1;
+    });
+    hero.addEventListener('pointerleave',()=>{heroTarget.strength=0;});
+    if(reduceMotion)drawHero(200);else requestAnimationFrame(animationLoop);
+    let rt;
+    window.addEventListener('resize',()=>{
+      clearTimeout(rt);
+      rt=setTimeout(()=>{
+        if(currentView==='eegView')drawEEG();
+        if(currentView==='diffusionView')updateDiffusion();
+        if(currentView==='homeView')drawHero(performance.now());
+      },130);
+    });
+  }
+  bindNavigation();bindCredits();bindEEG();bindDiffusion();bindArchitecture();bindAnimations();showRoute(true);
+})();
