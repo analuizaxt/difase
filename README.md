@@ -10,10 +10,6 @@
   An interactive scientific showcase for probabilistic modeling of neural signals.
 </p>
 
-<p align="center">
-  <strong>Research status: Ongoing master's research</strong> · <strong>Platform: Active development</strong>
-</p>
-
 ---
 
 ## About DIFASE
@@ -128,7 +124,7 @@ The Codec Pro and Helveticish font families are used when available, with system
 ## Institutional context
 
 <p align="center">
-  <img src="imagens/logos-github.png" alt="Institutional logos associated with the DIFASE research project" width="880">
+  <img src="/imagens/logos-institucionais.png" alt="Institutional logos associated with the DIFASE research project" width="880">
 </p>
 
 ---
