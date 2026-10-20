@@ -1,12 +1,10 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="imagens/difase-branco-trim.png">
     <img src="imagens/difase-preto-trim.png" alt="DIFASE — Diffusion Interface for Analysis, Synthesis & Exploration" width="440">
   </picture>
 </p>
 
 <p align="center">
-  <strong>Diffusion Interface for Analysis, Synthesis & Exploration</strong><br>
   An interactive scientific showcase for probabilistic modeling of neural signals.
 </p>
 
