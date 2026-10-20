@@ -1,6 +1,6 @@
 <p align="center">
   <picture>
-    <img src="imagens/difase-preto-trim.png" alt="DIFASE — Diffusion Interface for Analysis, Synthesis & Exploration" width="440">
+    <img src="imagens/difase-branco-trim.png" alt="DIFASE — Diffusion Interface for Analysis, Synthesis & Exploration" width="440">
   </picture>
 </p>
 
